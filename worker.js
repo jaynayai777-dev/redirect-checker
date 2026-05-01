@@ -1,3 +1,5 @@
+// worker.js
+
 const PAGESPEED_API_KEY = null; // Optional: add your API key or leave null to disable
 
 export default {
@@ -10,20 +12,44 @@ export default {
       }
 
       const startUrl = normalizeUrl(target);
+
+      // 1) Follow redirects and fetch main HTML
       const redirectResult = await followRedirects(startUrl);
       const { finalUrl, chain, status, response, html } = redirectResult;
 
-      // Basic headers & security
+      const origin = new URL(finalUrl).origin;
+
+      // 2) Security headers
       const securityHeaders = extractSecurityHeaders(response.headers);
 
-      // Parse HTML
+      // 3) Parse HTML into a lightweight "doc" wrapper
       const doc = parseHtml(html);
+
+      // 4) Indexing signals (robots, sitemaps, canonical, meta robots, x-robots-tag)
       const indexing = await collectIndexingSignals(finalUrl, response, doc);
+
+      // 5) Sitemap parsing (Phase 1A)
+      const sitemapSignals = await collectSitemapSignals(
+        indexing.robotsRulesSummary,
+        origin
+      );
+
+      // 6) Content signals (title, description, headings, word count, images)
       const content = collectContentSignals(doc);
+
+      // 7) Link signals (internal vs external, anchors)
       const links = collectLinkSignals(finalUrl, doc);
+
+      // 8) Technical signals (schema, OG, hreflang, viewport, mixed content)
       const technical = collectTechnicalSignals(response.headers, doc);
 
-      // External APIs (stubbed – wire real ones later)
+      // 9) Multi-page crawling (Phase 2A) – crawl up to 10 sitemap URLs
+      const crawlResults = await crawlPages(
+        sitemapSignals.discoveredUrls,
+        10 // adjust as needed
+      );
+
+      // 10) Stubbed external integrations (can be wired later)
       const performance = await collectPerformanceSignals(finalUrl, env);
       const offPage = await collectOffPageSignals(finalUrl, env);
       const competitors = await collectCompetitorSignals(finalUrl, env);
@@ -33,7 +59,10 @@ export default {
         finalUrl,
         redirectChain: chain,
         status,
-        indexing,
+        indexing: {
+          ...indexing,
+          sitemaps: sitemapSignals
+        },
         content,
         links,
         technical: {
@@ -42,7 +71,8 @@ export default {
         },
         performance,
         offPage,
-        competitors
+        competitors,
+        crawl: crawlResults
       };
 
       return jsonResponse(result, 200);
@@ -119,11 +149,9 @@ function extractSecurityHeaders(headers) {
   };
 }
 
-// Very lightweight HTML parsing using DOMParser-like approach via HTMLRewriter is possible,
-// but for simplicity we’ll use regex-ish extraction here. For production, consider a proper parser.
-
+// Simple "doc" wrapper – we keep raw HTML and let helpers operate on it
 function parseHtml(html) {
-  return { html }; // placeholder – we’ll pass raw HTML into helpers
+  return { html };
 }
 
 function collectContentSignals(doc) {
@@ -144,9 +172,10 @@ function collectContentSignals(doc) {
   };
 
   const images = matchAll(html, /<img[^>]*>/gi);
-  const missingAlt = images.filter((img) => !/alt=/i.test(img)).length;
+  const missingAlt = images.filter((img) => !/alt=/i.test(img.full)).length;
 
-  const textOnly = html.replace(/<script[\s\S]*?<\/script>/gi, "")
+  const textOnly = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<[^>]+>/g, " ");
   const words = textOnly
@@ -169,7 +198,9 @@ function collectContentSignals(doc) {
 
 function collectLinkSignals(baseUrl, doc) {
   const html = doc.html;
-  const linksRaw = matchAll(html, /<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi);
+  const linkRegex =
+    /<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const linksRaw = matchAll(html, linkRegex);
 
   const base = new URL(baseUrl);
   const internal = [];
@@ -200,14 +231,17 @@ function collectLinkSignals(baseUrl, doc) {
 function collectTechnicalSignals(headers, doc) {
   const html = doc.html;
 
-  const schemaJsonLd = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi.test(
-    html
-  );
+  const schemaJsonLd =
+    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi.test(
+      html
+    );
   const schemaMicrodata = /itemscope/i.test(html);
 
   const og = {
     hasOgTitle: /<meta[^>]+property=["']og:title["'][^>]*>/i.test(html),
-    hasOgDescription: /<meta[^>]+property=["']og:description["'][^>]*>/i.test(html),
+    hasOgDescription: /<meta[^>]+property=["']og:description["'][^>]*>/i.test(
+      html
+    ),
     hasOgImage: /<meta[^>]+property=["']og:image["'][^>]*>/i.test(html)
   };
 
@@ -224,7 +258,8 @@ function collectTechnicalSignals(headers, doc) {
   );
   const viewportMeta = viewportMatch ? viewportMatch[1].trim() : null;
 
-  const mixedContent = /https:\/\//i.test(html) && /http:\/\//i.test(html);
+  const mixedContent =
+    /https:\/\//i.test(html) && /http:\/\//i.test(html);
 
   return {
     schemaOrg: {
@@ -276,21 +311,100 @@ async function collectIndexingSignals(finalUrl, response, doc) {
 
   const xRobotsTag = response.headers.get("x-robots-tag");
 
-  const sitemaps = robotsRulesSummary.sitemaps.map((url) => ({
-    url,
-    type: "xml",
-    discoveredUrls: null // you can later fetch & count
-  }));
-
   return {
     robotsTxtUrl,
     robotsTxt,
     robotsRulesSummary,
-    sitemaps,
     canonical,
     metaRobots,
     xRobotsTag
   };
+}
+
+// Phase 1A – Sitemap parsing
+async function collectSitemapSignals(robotsRulesSummary, origin) {
+  const sitemapUrls = [...robotsRulesSummary.sitemaps];
+
+  if (sitemapUrls.length === 0) {
+    sitemapUrls.push(`${origin}/sitemap.xml`);
+  }
+
+  const discovered = [];
+
+  for (const sitemapUrl of sitemapUrls) {
+    try {
+      const res = await fetch(sitemapUrl);
+      if (!res.ok) continue;
+
+      const xml = await res.text();
+
+      if (xml.includes("<sitemapindex")) {
+        const childSitemaps = [...xml.matchAll(/<loc>(.*?)<\/loc>/g)].map(
+          (m) => m[1]
+        );
+        for (const child of childSitemaps) {
+          try {
+            const childRes = await fetch(child);
+            if (!childRes.ok) continue;
+            const childXml = await childRes.text();
+            const urls = [...childXml.matchAll(/<loc>(.*?)<\/loc>/g)].map(
+              (m) => m[1]
+            );
+            discovered.push(...urls);
+          } catch {
+            // ignore child sitemap errors
+          }
+        }
+      } else {
+        const urls = [...xml.matchAll(/<loc>(.*?)<\/loc>/g)].map(
+          (m) => m[1]
+        );
+        discovered.push(...urls);
+      }
+    } catch {
+      // ignore sitemap errors
+    }
+  }
+
+  return {
+    sitemapUrls,
+    discoveredUrls: discovered.slice(0, 5000)
+  };
+}
+
+// Phase 2A – Multi-page crawling
+async function crawlPages(urls, limit = 10) {
+  const results = [];
+
+  const max = Math.min(urls.length, limit);
+  for (let i = 0; i < max; i++) {
+    const url = urls[i];
+
+    try {
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": "JaySEO-AuditBot/1.0 (+https://yourdomain.com)"
+        }
+      });
+
+      if (!res.ok) continue;
+
+      const html = await res.text();
+      const doc = parseHtml(html);
+
+      results.push({
+        url,
+        status: res.status,
+        content: collectContentSignals(doc),
+        links: collectLinkSignals(url, doc),
+        technical: collectTechnicalSignals(res.headers, doc)
+      });
+    } catch {
+      // skip failed pages
+    }
+  }
+
+  return results;
 }
 
 function parseRobotsTxt(text) {
@@ -324,11 +438,9 @@ function matchAll(html, regex) {
   while ((m = regex.exec(html)) !== null) {
     const groups = {};
     if (m.length > 1) {
-      // named groups or positional
       if (m.groups) {
         Object.assign(groups, m.groups);
       } else {
-        // assume first capture is href, second is anchor when relevant
         groups.href = m[1];
         groups.anchor = m[2] || "";
       }
@@ -353,10 +465,6 @@ function stripTags(str) {
 
 // Stub external integrations – wire real APIs later
 async function collectPerformanceSignals(url, env) {
-  // Example: call PageSpeed Insights or your own CWV API
-  // const res = await fetch(`https://your-cwv-api?url=${encodeURIComponent(url)}&key=${env.CWV_API_KEY}`);
-  // const data = await res.json();
-  // return data;
   return {
     coreWebVitals: null,
     pageSpeedScore: null
@@ -364,13 +472,11 @@ async function collectPerformanceSignals(url, env) {
 }
 
 async function collectOffPageSignals(url, env) {
-  // Example: call backlink API
   return {
     backlinksSummary: null
   };
 }
 
 async function collectCompetitorSignals(url, env) {
-  // Example: call SERP API to get top 3 competitors
   return null;
 }
