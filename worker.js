@@ -1,7 +1,3 @@
-// worker.js
-
-const PAGESPEED_API_KEY = null; // Optional: add your API key or leave null to disable
-
 // worker.js — PRODUCTION READY, FULLY HARDENED
 
 const PAGESPEED_API_KEY = null; // Optional
