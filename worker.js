@@ -31,6 +31,10 @@ export default {
       const finalUrl = redirectResult.finalUrl;
       let baseResponse = redirectResult.finalResponse;
 
+      if (!baseResponse) {
+        return structuredServerError(startUrl, finalUrl, redirectResult.chain, 0);
+      }
+
       // 2) Read HTML + fallback for ASP.NET/server errors
       let html = await safeReadText(baseResponse);
       if (isAspNetError(html) || baseResponse.status >= 500) {
@@ -71,6 +75,24 @@ export default {
         .filter(u => stripHash(u) !== stripHash(finalUrl))
         .slice(0, Math.max(0, MAX_PAGES - 1));
 
+      // For duplicate content + link graph
+      const allPagesForDup = [];
+      if (mainPageSignals?.content?.hash) {
+        allPagesForDup.push({
+          url: finalUrl,
+          title: mainPageSignals.content.title,
+          hash: mainPageSignals.content.hash,
+        });
+      }
+
+      const linkGraph = { out: {}, in: {} };
+      const mainInternalLinks = mainPageSignals?.links?.internal || [];
+      linkGraph.out[stripHash(finalUrl)] = mainInternalLinks.length;
+      for (const l of mainInternalLinks) {
+        const dest = stripHash(l.href);
+        linkGraph.in[dest] = (linkGraph.in[dest] || 0) + 1;
+      }
+
       // 6) Crawl additional pages with crawl budget
       const crawlResults = [];
       for (const url of crawlTargets) {
@@ -107,6 +129,24 @@ export default {
 
           const pageSignals = await analyzePage(url, res, pageHtml, { light: true });
 
+          // Duplicate content tracking
+          if (pageSignals?.content?.hash) {
+            allPagesForDup.push({
+              url,
+              title: pageSignals.content.title,
+              hash: pageSignals.content.hash,
+            });
+          }
+
+          // Internal link graph tracking
+          const internalLinks = pageSignals?.links?.internal || [];
+          const srcKey = stripHash(url);
+          linkGraph.out[srcKey] = internalLinks.length;
+          for (const l of internalLinks) {
+            const dest = stripHash(l.href);
+            linkGraph.in[dest] = (linkGraph.in[dest] || 0) + 1;
+          }
+
           crawlResults.push({
             url,
             status: res.status,
@@ -123,7 +163,16 @@ export default {
         }
       }
 
-      // 7) Final audit object
+      // 7) Higher-level summaries
+
+      const duplicateContent = summarizeDuplicateContent(allPagesForDup);
+      const internalLinkGraphSummary = summarizeInternalLinkGraph(linkGraph);
+      const hreflangValidation = validateHreflang(
+        mainPageSignals?.technical?.hreflang || [],
+        finalUrl
+      );
+
+      // 8) Final audit object
       const audit = {
         url: startUrl,
         finalUrl,
@@ -137,6 +186,9 @@ export default {
         offPage: { backlinksSummary: null },
         competitors: null,
         crawl: crawlResults,
+        duplicateContent,
+        internalLinkGraphSummary,
+        hreflangValidation,
       };
 
       return json(audit);
@@ -219,6 +271,15 @@ function stripHash(url) {
   } catch {
     return url;
   }
+}
+
+function simpleHash(str) {
+  if (!str) return null;
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash * 31 + str.charCodeAt(i)) | 0;
+  }
+  return hash.toString();
 }
 
 /* ----------------- REDIRECT FOLLOW ----------------- */
@@ -332,10 +393,12 @@ function structuredServerError(startUrl, finalUrl, chain, status) {
       headings: { h1: [], h2: [], h3: [] },
       wordCount: 0,
       images: { total: 0, missingAlt: 0 },
+      textSample: null,
+      hash: null,
     },
     links: { internal: [], external: [] },
     technical: {
-      schemaOrg: { hasJsonLd: false, hasMicrodata: false },
+      schemaOrg: { hasJsonLd: false, hasMicrodata: false, jsonLd: [] },
       openGraph: { hasOgTitle: false, hasOgDescription: false, hasOgImage: false },
       hreflang: [],
       viewportMeta: null,
@@ -352,10 +415,14 @@ function structuredServerError(startUrl, finalUrl, chain, status) {
     offPage: { backlinksSummary: null },
     competitors: null,
     crawl: [],
+    duplicateContent: { groups: [] },
+    internalLinkGraphSummary: null,
+    hreflangValidation: null,
   };
 
   return json(audit);
 }
+
 /* ----------------- INDEXING (ROBOTS + SITEMAPS) ----------------- */
 
 async function getIndexingSignals(finalUrl) {
@@ -450,7 +517,7 @@ async function parseSitemap(sitemapUrl) {
 /* ----------------- PAGE ANALYSIS ----------------- */
 
 async function analyzePage(url, res, html, options = {}) {
-  const light = options.light === true; // kept for future use if you want to branch logic
+  const light = options.light === true; // kept for future branching if needed
 
   const content = extractContent(html);
   const links = extractLinks(url, html);
@@ -502,6 +569,8 @@ function extractContent(html) {
   }
 
   const wordCount = textOnly ? textOnly.split(/\s+/).length : 0;
+  const textSample = textOnly ? textOnly.slice(0, 500) : null;
+  const hash = textOnly ? simpleHash(textOnly) : null;
 
   let images = [];
   try {
@@ -524,6 +593,8 @@ function extractContent(html) {
     headings: { h1, h2, h3 },
     wordCount,
     images: { total: totalImages, missingAlt },
+    textSample,
+    hash,
   };
 }
 
@@ -562,7 +633,23 @@ function extractLinks(baseUrl, html) {
 function extractTechnical(url, res, html) {
   if (!html) html = "";
 
-  const hasJsonLd = /<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/i.test(html);
+  // JSON-LD extraction
+  const jsonLdBlocks = [];
+  try {
+    const jsonLdRegex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    let m;
+    while ((m = jsonLdRegex.exec(html)) !== null) {
+      const raw = m[1].trim();
+      try {
+        const parsed = JSON.parse(raw);
+        jsonLdBlocks.push(parsed);
+      } catch {
+        jsonLdBlocks.push({ _raw: raw });
+      }
+    }
+  } catch {}
+
+  const hasJsonLd = jsonLdBlocks.length > 0;
   const hasMicrodata = /\sitemscope(\s|>)/i.test(html);
 
   const hasOgTitle = /<meta[^>]+property=["']og:title["'][^>]*>/i.test(html);
@@ -591,7 +678,7 @@ function extractTechnical(url, res, html) {
   };
 
   return {
-    schemaOrg: { hasJsonLd, hasMicrodata },
+    schemaOrg: { hasJsonLd, hasMicrodata, jsonLd: jsonLdBlocks },
     openGraph: { hasOgTitle, hasOgDescription, hasOgImage },
     hreflang: extractHreflang(html),
     viewportMeta,
@@ -677,7 +764,9 @@ function decodeHtml(str) {
   if (!str) return "";
   const map = {
     "&amp;": "&",
+    "&lt": "<",
     "&lt;": "<",
+    "&gt": ">",
     "&gt;": ">",
     "&quot;": '"',
     "&#39;": "'",
@@ -686,4 +775,109 @@ function decodeHtml(str) {
     "&nbsp;": " ",
   };
   return str.replace(/(&amp;|&lt;|&gt;|&quot;|&#39;|&#160;|&#160|&nbsp;)/g, m => map[m] || m);
+}
+
+/* ----------------- DUPLICATE CONTENT SUMMARY ----------------- */
+
+function summarizeDuplicateContent(pages) {
+  const byHash = {};
+  for (const p of pages) {
+    if (!p.hash) continue;
+    if (!byHash[p.hash]) byHash[p.hash] = [];
+    byHash[p.hash].push(p);
+  }
+
+  const groups = [];
+  for (const hash in byHash) {
+    const group = byHash[hash];
+    if (group.length > 1) {
+      groups.push({
+        hash,
+        urls: group.map(g => g.url),
+        titles: group.map(g => g.title || null),
+      });
+    }
+  }
+
+  return { groups };
+}
+
+/* ----------------- INTERNAL LINK GRAPH SUMMARY ----------------- */
+
+function summarizeInternalLinkGraph(linkGraph) {
+  const out = linkGraph.out || {};
+  const inn = linkGraph.in || {};
+
+  const totalInternalLinks = Object.values(out).reduce((sum, v) => sum + (v || 0), 0);
+
+  const outEntries = Object.entries(out).map(([url, count]) => ({ url, count }));
+  const inEntries = Object.entries(inn).map(([url, count]) => ({ url, count }));
+
+  outEntries.sort((a, b) => b.count - a.count);
+  inEntries.sort((a, b) => b.count - a.count);
+
+  return {
+    totalInternalLinks,
+    topOutDegree: outEntries.slice(0, 5),
+    topInDegree: inEntries.slice(0, 5),
+  };
+}
+
+/* ----------------- HREFLANG VALIDATION ----------------- */
+
+function validateHreflang(hreflangArray, pageUrl) {
+  if (!hreflangArray || hreflangArray.length === 0) {
+    return {
+      status: "none",
+      issues: [],
+      summary: { total: 0, pageUrl },
+    };
+  }
+
+  const issues = [];
+  const seenPairs = new Set();
+  let xDefaultCount = 0;
+
+  const langRegex = /^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$/;
+
+  for (const item of hreflangArray) {
+    const lang = item.hreflang;
+    const href = item.href;
+    const key = `${lang}||${href}`;
+
+    if (seenPairs.has(key)) {
+      issues.push({
+        type: "duplicate",
+        message: `Duplicate hreflang+href combination: ${lang} -> ${href}`,
+      });
+    } else {
+      seenPairs.add(key);
+    }
+
+    if (lang.toLowerCase() === "x-default") {
+      xDefaultCount++;
+    } else if (!langRegex.test(lang)) {
+      issues.push({
+        type: "invalid-lang-code",
+        message: `Invalid hreflang code: ${lang}`,
+      });
+    }
+  }
+
+  if (xDefaultCount > 1) {
+    issues.push({
+      type: "multiple-x-default",
+      message: "Multiple x-default hreflang entries detected.",
+    });
+  }
+
+  return {
+    status: "present",
+    issues,
+    summary: {
+      total: hreflangArray.length,
+      xDefaultCount,
+      pageUrl,
+    },
+  };
 }
