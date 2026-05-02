@@ -120,6 +120,15 @@ function jsonError(message, status = 500, raw = null) {
   });
 }
 
+function extractHomepageLinks(baseUrl, mainPageSignals) {
+  const origin = getOrigin(baseUrl);
+  if (!origin) return [];
+
+  return mainPageSignals.links.internal
+    .map(l => l.href)
+    .filter(href => href.startsWith(origin));
+}
+
 /* ----------------- UTILITIES ----------------- */
 
 function normalizeUrl(input) {
