@@ -540,3 +540,97 @@ function extractTechnical(url, res, html) {
   return {
     schemaOrg: { hasJsonLd, hasMicrodata },
     openGraph: { hasOgTitle, hasOgDescription, hasOgImage },
+    hreflang: extractHreflang(html),
+    viewportMeta,
+    mixedContent,
+    securityHeaders,
+  };
+}
+
+/* ----------------- META / CANONICAL / HREFLANG ----------------- */
+
+function extractCanonical(baseUrl, html) {
+  const match = html.match(
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["'][^>]*>/i
+  );
+  if (!match) return null;
+  try {
+    return new URL(match[1].trim(), baseUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractMetaRobots(html) {
+  const match = html.match(
+    /<meta[^>]+name=["']robots["'][^>]+content=["']([^"']+)["'][^>]*>/i
+  );
+  return match ? match[1].trim() : null;
+}
+
+function extractMeta(html, name) {
+  const regex = new RegExp(
+    `<meta[^>]+name=["']${name}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    "i"
+  );
+  const match = html.match(regex);
+  return match ? match[1].trim() : null;
+}
+
+function extractHreflang(html) {
+  if (!html) return [];
+
+  const results = [];
+  const linkRegex =
+    /<link[^>]+rel=["']alternate["'][^>]+hreflang=["']([^"']+)["'][^>]+href=["']([^"']+)["'][^>]*>/gi;
+
+  let match;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const lang = match?.[1]?.trim() || null;
+    const href = match?.[2]?.trim() || null;
+    if (lang && href) {
+      results.push({ hreflang: lang, href });
+    }
+  }
+
+  return results;
+}
+
+/* ----------------- MIXED CONTENT ----------------- */
+
+function detectMixedContent(pageUrl, html) {
+  try {
+    const u = new URL(pageUrl);
+    if (u.protocol !== "https:") return false;
+  } catch {
+    return false;
+  }
+  return /http:\/\//i.test(html);
+}
+
+/* ----------------- TEXT CLEANUP ----------------- */
+
+function cleanText(str) {
+  if (!str) return "";
+  return decodeHtml(
+    str
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
+function decodeHtml(str) {
+  if (!str) return "";
+  const map = {
+    "&amp;": "&",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&#39;": "'",
+    "&#160": " ",
+    "&#160;": " ",
+    "&nbsp;": " ",
+  };
+  return str.replace(/(&amp;|&lt;|&gt;|&quot;|&#39;|&#160;|&#160|&nbsp;)/g, m => map[m] || m);
+}
