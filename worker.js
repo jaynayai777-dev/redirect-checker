@@ -7,58 +7,58 @@ export default {
     try {
       const { searchParams } = new URL(request.url);
       const target = searchParams.get("url");
-
-      if (!target) {
-        return jsonError("Missing ?url parameter", 400);
-      }
+      if (!target) return jsonError("Missing ?url parameter", 400);
 
       const startUrl = normalizeUrl(target);
-      if (!startUrl) {
-        return jsonError("Invalid URL", 400);
+      if (!startUrl) return jsonError("Invalid URL", 400);
+
+      const MAX_PAGES = 50;
+
+      // 1) Resolve redirects with robust follow
+      const redirectResult = await robustRedirectFollow(startUrl);
+      const finalUrl = redirectResult.finalUrl;
+      let baseResponse = redirectResult.finalResponse;
+
+      // 2) Read HTML and detect ASP.NET / server error
+      let html = await baseResponse.text();
+      if (isAspNetError(html) || baseResponse.status >= 500) {
+        const fallback = await tryFallbackFetches(finalUrl);
+        if (!fallback) {
+          return structuredServerError(startUrl, finalUrl, redirectResult.chain, baseResponse.status);
+        }
+        baseResponse = fallback;
+        html = await baseResponse.text();
+        if (isAspNetError(html) || baseResponse.status >= 500) {
+          return structuredServerError(startUrl, finalUrl, redirectResult.chain, baseResponse.status);
+        }
       }
 
-      const MAX_PAGES = 50; // tune as needed
-
-      // 1) Resolve redirects and get final URL + base response
-      const redirectResult = await followRedirects(startUrl);
-      const finalUrl = redirectResult.finalUrl;
-      const baseResponse = redirectResult.finalResponse;
-
-      // 2) Fetch robots.txt + sitemap(s)
+      // 3) Indexing signals (robots + sitemaps)
       const indexing = await getIndexingSignals(finalUrl);
 
-      // 3) Fetch main page HTML and extract signals
-      const mainHtml = await baseResponse.text();
-      const mainPageSignals = await analyzePage(finalUrl, baseResponse, mainHtml);
+      // 4) Analyze main page
+      const mainPageSignals = await analyzePage(finalUrl, baseResponse, html);
 
-      // 4) Discover crawl targets (sitemap → fallback to homepage links)
-      const discoveredFromSitemap = indexing.sitemaps.sitemapUrls.length
+      // 5) Discover crawl targets (sitemap → homepage fallback)
+      let crawlTargets = indexing.sitemaps.discoveredUrls.length
         ? indexing.sitemaps.discoveredUrls
-        : [];
+        : extractHomepageLinks(finalUrl, mainPageSignals);
 
-      let crawlTargets = [...discoveredFromSitemap];
+      crawlTargets = crawlTargets
+        .filter(u => stripHash(u) !== stripHash(finalUrl))
+        .slice(0, Math.max(0, MAX_PAGES - 1));
 
-      if (crawlTargets.length === 0) {
-        // Fallback: discover from homepage internal links
-        const homepageLinks = mainPageSignals.links.internal
-          .map(l => l.href)
-          .filter(href => href && href.startsWith(getOrigin(finalUrl)));
-        crawlTargets = Array.from(new Set(homepageLinks));
-      }
-
-      // Ensure we don't re-crawl the main URL
-      crawlTargets = crawlTargets.filter(u => stripHash(u) !== stripHash(finalUrl));
-
-      // Limit to MAX_PAGES - 1 (main page already analyzed)
-      crawlTargets = crawlTargets.slice(0, Math.max(0, MAX_PAGES - 1));
-
-      // 5) Crawl additional pages (shallow analysis for now)
+      // 6) Crawl additional pages (light analysis)
       const crawlResults = [];
       for (const url of crawlTargets) {
         try {
-          const res = await fetch(url, { redirect: "follow" });
-          const html = await res.text();
-          const pageSignals = await analyzePage(url, res, html, { light: true });
+          const res = await fetch(url, browserHeaders());
+          const pageHtml = await res.text();
+          if (isAspNetError(pageHtml)) {
+            crawlResults.push({ url, status: res.status, error: "ASP.NET error page" });
+            continue;
+          }
+          const pageSignals = await analyzePage(url, res, pageHtml, { light: true });
           crawlResults.push({
             url,
             status: res.status,
@@ -67,21 +67,16 @@ export default {
             metaRobots: pageSignals.indexing.metaRobots,
           });
         } catch (e) {
-          crawlResults.push({
-            url,
-            status: null,
-            error: String(e?.message || e),
-          });
+          crawlResults.push({ url, status: null, error: String(e?.message || e) });
         }
       }
 
-      // 6) Build final audit object (single-item array, like your current output)
+      // 7) Final audit object (single item array)
       const audit = {
         url: startUrl,
         finalUrl,
         redirectChain: redirectResult.chain,
         status: baseResponse.status,
-
         indexing,
         content: mainPageSignals.content,
         links: mainPageSignals.links,
@@ -97,31 +92,35 @@ export default {
         crawl: crawlResults,
       };
 
-      return new Response(JSON.stringify([audit], null, 2), {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
+      return json(audit);
     } catch (err) {
       return jsonError("Worker error", 500, err);
     }
   },
 };
 
-/* ----------------- Helpers ----------------- */
+/* ----------------- JSON HELPERS ----------------- */
 
-function jsonError(message, status = 500, rawError = null) {
+function json(obj) {
+  return new Response(JSON.stringify([obj], null, 2), {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function jsonError(message, status = 500, raw = null) {
   const body = {
     error: "Worker error",
     message,
   };
-  if (rawError) {
-    body.details = String(rawError?.message || rawError);
-  }
+  if (raw) body.details = String(raw);
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 }
+
+/* ----------------- UTILITIES ----------------- */
 
 function normalizeUrl(input) {
   try {
@@ -152,14 +151,17 @@ function stripHash(url) {
   }
 }
 
-async function followRedirects(startUrl, maxHops = 10) {
+/* ----------------- REDIRECT FOLLOW ----------------- */
+
+async function robustRedirectFollow(startUrl, maxHops = 10) {
   const chain = [];
   let currentUrl = startUrl;
   let lastResponse = null;
 
   for (let i = 0; i < maxHops; i++) {
-    const res = await fetch(currentUrl, { redirect: "manual" });
+    const res = await fetch(currentUrl, { redirect: "manual", ...browserHeaders() });
     const location = res.headers.get("location");
+
     chain.push({
       url: currentUrl,
       status: res.status,
@@ -172,8 +174,7 @@ async function followRedirects(startUrl, maxHops = 10) {
       continue;
     }
 
-    // Final response (200, 4xx, 5xx, etc.)
-    lastResponse = await fetch(currentUrl, { redirect: "follow" });
+    lastResponse = await fetch(currentUrl, { redirect: "follow", ...browserHeaders() });
     chain.push({
       url: currentUrl,
       status: lastResponse.status,
@@ -189,18 +190,113 @@ async function followRedirects(startUrl, maxHops = 10) {
   };
 }
 
+/* ----------------- BROWSER HEADERS ----------------- */
+
+function browserHeaders() {
+  return {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+      Connection: "keep-alive",
+    },
+  };
+}
+
+/* ----------------- ASP.NET / SERVER ERROR HANDLING ----------------- */
+
+function isAspNetError(html) {
+  if (!html) return false;
+  const patterns = [
+    "Server Error in '/' Application.",
+    "Object reference not set to an instance of an object.",
+    "Runtime Error",
+  ];
+  return patterns.some(p => html.includes(p));
+}
+
+async function tryFallbackFetches(url) {
+  const strategies = [
+    () => fetch(url, browserHeaders()),
+    () => fetch(url, { redirect: "follow", ...browserHeaders() }),
+    () => fetch(url, { redirect: "manual", ...browserHeaders() }),
+    () => fetch(url, { cf: { httpProtocol: "http1.1" }, ...browserHeaders() }),
+  ];
+
+  for (const attempt of strategies) {
+    try {
+      const res = await attempt();
+      const html = await res.text();
+      if (res.ok && !isAspNetError(html)) {
+        // Re-wrap to reuse body later
+        return new Response(html, { status: res.status, headers: res.headers });
+      }
+    } catch {
+      // ignore and try next
+    }
+  }
+  return null;
+}
+
+function structuredServerError(startUrl, finalUrl, chain, status) {
+  const audit = {
+    url: startUrl,
+    finalUrl,
+    redirectChain: chain,
+    status,
+    indexing: {
+      robotsTxtUrl: null,
+      robotsTxt: null,
+      robotsRulesSummary: { blockedPaths: [], sitemaps: [] },
+      canonical: null,
+      metaRobots: null,
+      xRobotsTag: null,
+      sitemaps: { sitemapUrls: [], discoveredUrls: [] },
+    },
+    content: {
+      title: null,
+      description: null,
+      headings: { h1: [], h2: [], h3: [] },
+      wordCount: 0,
+      images: { total: 0, missingAlt: 0 },
+    },
+    links: { internal: [], external: [] },
+    technical: {
+      schemaOrg: { hasJsonLd: false, hasMicrodata: false },
+      openGraph: { hasOgTitle: false, hasOgDescription: false, hasOgImage: false },
+      hreflang: [],
+      viewportMeta: null,
+      mixedContent: false,
+      securityHeaders: {
+        strictTransportSecurity: null,
+        contentSecurityPolicy: null,
+        xFrameOptions: null,
+        xContentTypeOptions: null,
+        referrerPolicy: null,
+      },
+    },
+    performance: { coreWebVitals: null, pageSpeedScore: null },
+    offPage: { backlinksSummary: null },
+    competitors: null,
+    crawl: [],
+  };
+
+  return json(audit);
+}
+
+/* ----------------- INDEXING (ROBOTS + SITEMAPS) ----------------- */
+
 async function getIndexingSignals(finalUrl) {
   const origin = getOrigin(finalUrl);
   const robotsTxtUrl = origin ? `${origin}/robots.txt` : null;
 
   let robotsTxt = null;
   let robotsRulesSummary = { blockedPaths: [], sitemaps: [] };
-  let metaRobots = null;
-  let xRobotsTag = null;
 
   if (robotsTxtUrl) {
     try {
-      const res = await fetch(robotsTxtUrl);
+      const res = await fetch(robotsTxtUrl, browserHeaders());
       if (res.ok) {
         robotsTxt = await res.text();
         robotsRulesSummary = parseRobotsTxt(robotsTxt);
@@ -210,9 +306,8 @@ async function getIndexingSignals(finalUrl) {
     }
   }
 
-  // Sitemaps from robots.txt + heuristic default
   const sitemapUrls = new Set(robotsRulesSummary.sitemaps || []);
-  sitemapUrls.add(`${origin}/sitemap.xml`);
+  if (origin) sitemapUrls.add(`${origin}/sitemap.xml`);
 
   const discoveredUrls = [];
   for (const smUrl of sitemapUrls) {
@@ -228,9 +323,9 @@ async function getIndexingSignals(finalUrl) {
     robotsTxtUrl,
     robotsTxt,
     robotsRulesSummary,
-    canonical: null, // filled per-page in analyzePage if needed
-    metaRobots,
-    xRobotsTag,
+    canonical: null,
+    metaRobots: null,
+    xRobotsTag: null,
     sitemaps: {
       sitemapUrls: Array.from(sitemapUrls),
       discoveredUrls: Array.from(new Set(discoveredUrls)),
@@ -262,20 +357,17 @@ function parseRobotsTxt(text) {
 }
 
 async function parseSitemap(sitemapUrl) {
-  const res = await fetch(sitemapUrl);
+  const res = await fetch(sitemapUrl, browserHeaders());
   if (!res.ok) return [];
 
   const contentType = res.headers.get("content-type") || "";
   const body = await res.text();
 
   if (!contentType.includes("xml") && !body.includes("<urlset") && !body.includes("<sitemapindex")) {
-    // Likely HTML or something else
     return [];
   }
 
   const urls = [];
-
-  // Simple <loc> extraction
   const locRegex = /<loc>([^<]+)<\/loc>/gi;
   let match;
   while ((match = locRegex.exec(body)) !== null) {
@@ -289,6 +381,8 @@ async function parseSitemap(sitemapUrl) {
 
   return urls;
 }
+
+/* ----------------- PAGE ANALYSIS ----------------- */
 
 async function analyzePage(url, res, html, options = {}) {
   const light = options.light === true;
@@ -314,26 +408,21 @@ async function analyzePage(url, res, html, options = {}) {
   };
 
   if (light) {
-    // For crawled pages, we keep it shallow
     return { content, links, technical, indexing };
   }
 
   return { content, links, technical, indexing };
 }
 
+/* ----------------- CONTENT EXTRACTION ----------------- */
+
 function extractContent(html) {
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? decodeHtml(titleMatch[1].trim()) : null;
 
-  const h2 = Array.from(html.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/gi)).map(m =>
-    cleanText(m[1])
-  );
-  const h3 = Array.from(html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gi)).map(m =>
-    cleanText(m[1])
-  );
-  const h1 = Array.from(html.matchAll(/<h1[^>]*>([\s\S]*?)<\/h1>/gi)).map(m =>
-    cleanText(m[1])
-  );
+  const h1 = Array.from(html.matchAll(/<h1[^>]*>([\s\S]*?)<\/h1>/gi)).map(m => cleanText(m[1]));
+  const h2 = Array.from(html.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/gi)).map(m => cleanText(m[1]));
+  const h3 = Array.from(html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gi)).map(m => cleanText(m[1]));
 
   const textOnly = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -365,6 +454,8 @@ function extractContent(html) {
   };
 }
 
+/* ----------------- LINK EXTRACTION ----------------- */
+
 function extractLinks(baseUrl, html) {
   const origin = getOrigin(baseUrl);
   const internal = [];
@@ -391,6 +482,8 @@ function extractLinks(baseUrl, html) {
 
   return { internal, external };
 }
+
+/* ----------------- TECHNICAL SIGNALS ----------------- */
 
 function extractTechnical(url, res, html) {
   const hasJsonLd = /<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/i.test(
@@ -435,6 +528,8 @@ function extractTechnical(url, res, html) {
   };
 }
 
+/* ----------------- META / CANONICAL / HREFLANG ----------------- */
+
 function extractCanonical(baseUrl, html) {
   const match = html.match(
     /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["'][^>]*>/i
@@ -477,6 +572,8 @@ function extractHreflang(html) {
   return results;
 }
 
+/* ----------------- MIXED CONTENT ----------------- */
+
 function detectMixedContent(pageUrl, html) {
   try {
     const u = new URL(pageUrl);
@@ -484,10 +581,10 @@ function detectMixedContent(pageUrl, html) {
   } catch {
     return false;
   }
-
-  // crude but effective: look for http:// resources
   return /http:\/\//i.test(html);
 }
+
+/* ----------------- TEXT CLEANUP ----------------- */
 
 function cleanText(str) {
   return decodeHtml(
@@ -505,8 +602,9 @@ function decodeHtml(str) {
     "&gt;": ">",
     "&quot;": '"',
     "&#39;": "'",
+    "&#160": " ",
     "&#160;": " ",
     "&nbsp;": " ",
   };
-  return str.replace(/(&amp;|&lt;|&gt;|&quot;|&#39;|&#160;|&nbsp;)/g, m => map[m] || m);
+  return str.replace(/(&amp;|&lt;|&gt;|&quot;|&#39;|&#160;|&#160|&nbsp;)/g, m => map[m] || m);
 }
