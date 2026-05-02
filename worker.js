@@ -124,10 +124,16 @@ function extractHomepageLinks(baseUrl, mainPageSignals) {
   const origin = getOrigin(baseUrl);
   if (!origin) return [];
 
-  return mainPageSignals.links.internal
+  const internalLinks =
+    mainPageSignals?.links?.internal && Array.isArray(mainPageSignals.links.internal)
+      ? mainPageSignals.links.internal
+      : [];
+
+  return internalLinks
     .map(l => l.href)
-    .filter(href => href.startsWith(origin));
+    .filter(href => href && href.startsWith(origin));
 }
+
 
 /* ----------------- UTILITIES ----------------- */
 
