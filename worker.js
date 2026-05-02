@@ -2,6 +2,20 @@
 
 const PAGESPEED_API_KEY = null; // Optional
 
+// --- Crawl budget + safe fetch ---
+let subrequestCount = 0;
+
+async function safeFetch(url, opts) {
+  if (subrequestCount >= 40) {
+    return null; // leave room for main page + fallback, redirects, etc.
+  }
+  subrequestCount++;
+  return await fetch(url, opts);
+}
+
+// --- Max pages to crawl (excluding the main URL) ---
+const MAX_PAGES = 12;
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -11,8 +25,6 @@ export default {
 
       const startUrl = normalizeUrl(target);
       if (!startUrl) return jsonError("Invalid URL", 400);
-
-      const MAX_PAGES = 50;
 
       // 1) Resolve redirects
       const redirectResult = await robustRedirectFollow(startUrl);
@@ -24,12 +36,22 @@ export default {
       if (isAspNetError(html) || baseResponse.status >= 500) {
         const fallback = await tryFallbackFetches(finalUrl);
         if (!fallback) {
-          return structuredServerError(startUrl, finalUrl, redirectResult.chain, baseResponse.status);
+          return structuredServerError(
+            startUrl,
+            finalUrl,
+            redirectResult.chain,
+            baseResponse.status
+          );
         }
         baseResponse = fallback;
         html = await safeReadText(baseResponse);
         if (isAspNetError(html) || baseResponse.status >= 500) {
-          return structuredServerError(startUrl, finalUrl, redirectResult.chain, baseResponse.status);
+          return structuredServerError(
+            startUrl,
+            finalUrl,
+            redirectResult.chain,
+            baseResponse.status
+          );
         }
       }
 
@@ -44,19 +66,42 @@ export default {
         ? indexing.sitemaps.discoveredUrls
         : extractHomepageLinks(finalUrl, mainPageSignals);
 
-      crawlTargets = crawlTargets
+      // Deduplicate + avoid crawling the main URL again + cap by MAX_PAGES
+      crawlTargets = [...new Set(crawlTargets)]
         .filter(u => stripHash(u) !== stripHash(finalUrl))
         .slice(0, Math.max(0, MAX_PAGES - 1));
 
-      // 6) Crawl additional pages
+      // 6) Crawl additional pages with crawl budget
       const crawlResults = [];
       for (const url of crawlTargets) {
+        if (subrequestCount >= 40) {
+          crawlResults.push({
+            url,
+            status: null,
+            error: "crawl budget exceeded",
+          });
+          continue;
+        }
+
         try {
-          const res = await fetch(url, browserHeaders());
+          const res = await safeFetch(url, browserHeaders());
+          if (!res) {
+            crawlResults.push({
+              url,
+              status: null,
+              error: "crawl budget exceeded",
+            });
+            continue;
+          }
+
           const pageHtml = await safeReadText(res);
 
           if (isAspNetError(pageHtml)) {
-            crawlResults.push({ url, status: res.status, error: "ASP.NET error page" });
+            crawlResults.push({
+              url,
+              status: res.status,
+              error: "ASP.NET error page",
+            });
             continue;
           }
 
@@ -70,7 +115,11 @@ export default {
             metaRobots: pageSignals.indexing.metaRobots,
           });
         } catch (e) {
-          crawlResults.push({ url, status: null, error: String(e?.message || e) });
+          crawlResults.push({
+            url,
+            status: null,
+            error: String(e?.message || e),
+          });
         }
       }
 
@@ -180,7 +229,9 @@ async function robustRedirectFollow(startUrl, maxHops = 10) {
   let lastResponse = null;
 
   for (let i = 0; i < maxHops; i++) {
-    const res = await fetch(currentUrl, { redirect: "manual", ...browserHeaders() });
+    const res = await safeFetch(currentUrl, { redirect: "manual", ...browserHeaders() });
+    if (!res) break;
+
     const location = res.headers.get("location");
 
     chain.push({
@@ -195,7 +246,13 @@ async function robustRedirectFollow(startUrl, maxHops = 10) {
       continue;
     }
 
-    lastResponse = await fetch(currentUrl, { redirect: "follow", ...browserHeaders() });
+    const followRes = await safeFetch(currentUrl, { redirect: "follow", ...browserHeaders() });
+    if (!followRes) {
+      lastResponse = res;
+      break;
+    }
+
+    lastResponse = followRes;
     chain.push({
       url: currentUrl,
       status: lastResponse.status,
@@ -235,15 +292,16 @@ function isAspNetError(html) {
 
 async function tryFallbackFetches(url) {
   const strategies = [
-    () => fetch(url, browserHeaders()),
-    () => fetch(url, { redirect: "follow", ...browserHeaders() }),
-    () => fetch(url, { redirect: "manual", ...browserHeaders() }),
-    () => fetch(url, { cf: { httpProtocol: "http1.1" }, ...browserHeaders() }),
+    () => safeFetch(url, browserHeaders()),
+    () => safeFetch(url, { redirect: "follow", ...browserHeaders() }),
+    () => safeFetch(url, { redirect: "manual", ...browserHeaders() }),
+    () => safeFetch(url, { cf: { httpProtocol: "http1.1" }, ...browserHeaders() }),
   ];
 
   for (const attempt of strategies) {
     try {
       const res = await attempt();
+      if (!res) continue;
       const html = await safeReadText(res);
       if (res.ok && !isAspNetError(html)) {
         return new Response(html, { status: res.status, headers: res.headers });
@@ -298,7 +356,6 @@ function structuredServerError(startUrl, finalUrl, chain, status) {
 
   return json(audit);
 }
-
 /* ----------------- INDEXING (ROBOTS + SITEMAPS) ----------------- */
 
 async function getIndexingSignals(finalUrl) {
@@ -310,8 +367,8 @@ async function getIndexingSignals(finalUrl) {
 
   if (robotsTxtUrl) {
     try {
-      const res = await fetch(robotsTxtUrl, browserHeaders());
-      if (res.ok) {
+      const res = await safeFetch(robotsTxtUrl, browserHeaders());
+      if (res && res.ok) {
         robotsTxt = await safeReadText(res);
         robotsRulesSummary = parseRobotsTxt(robotsTxt);
       }
@@ -367,8 +424,8 @@ function parseRobotsTxt(text) {
 }
 
 async function parseSitemap(sitemapUrl) {
-  const res = await fetch(sitemapUrl, browserHeaders());
-  if (!res.ok) return [];
+  const res = await safeFetch(sitemapUrl, browserHeaders());
+  if (!res || !res.ok) return [];
 
   const contentType = res.headers.get("content-type") || "";
   const body = await safeReadText(res);
@@ -393,7 +450,7 @@ async function parseSitemap(sitemapUrl) {
 /* ----------------- PAGE ANALYSIS ----------------- */
 
 async function analyzePage(url, res, html, options = {}) {
-  const light = options.light === true;
+  const light = options.light === true; // kept for future use if you want to branch logic
 
   const content = extractContent(html);
   const links = extractLinks(url, html);
