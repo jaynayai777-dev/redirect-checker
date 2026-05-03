@@ -19,6 +19,9 @@ const MAX_PAGES = 12;
 export default {
   async fetch(request, env, ctx) {
     try {
+      // Reset crawl budget for each incoming request
+      subrequestCount = 0;
+      
       const { searchParams } = new URL(request.url);
       const target = searchParams.get("url");
       if (!target) return jsonError("Missing ?url parameter", 400);
